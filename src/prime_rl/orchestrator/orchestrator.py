@@ -667,10 +667,7 @@ async def orchestrate(config: OrchestratorConfig):
             "is_truncated/mean": results_df.groupby("example_id").is_truncated.mean().mean(),
             "is_truncated/max": results_df.groupby("example_id").is_truncated.mean().max(),
             "is_truncated/min": results_df.groupby("example_id").is_truncated.mean().min(),
-            "stop_condition/generation_truncated": (
-                results_df.is_truncated & (results_df.stop_condition != "prompt_too_long")
-            ).mean(),
-            # Log rate of each stop condition (e.g. max_turns, prompt_too_long, has_error)
+            # Log rate of each stop condition (e.g. gibberish, repetition)
             **{
                 f"stop_condition/{sc}": rate
                 for sc, rate in results_df.stop_condition.dropna().value_counts(normalize=True).items()
