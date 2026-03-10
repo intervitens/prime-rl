@@ -1,7 +1,6 @@
 import asyncio
 import gc
 import multiprocessing as mp
-import random
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -745,8 +744,7 @@ async def orchestrate(config: OrchestratorConfig):
         monitor.log(to_log, step=progress.step)
 
         # Log samples to monitor(s) if enabled
-        subset_train_rollouts = random.sample(train_rollouts, min(8, len(train_rollouts)))
-        monitor.log_samples(subset_train_rollouts, step=progress.step)
+        monitor.log_samples(train_rollouts, step=progress.step)
 
         # Log distributions (rewards, advantages) if enabled
         monitor.log_distributions(

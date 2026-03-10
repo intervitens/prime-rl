@@ -247,6 +247,15 @@ class LogExtrasConfig(BaseConfig):
         ),
     ] = True
 
+    max_samples: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description="Maximum number of rollout samples to log per step. "
+            "Set to None to log all rollouts (no limit). Default: 8.",
+        ),
+    ] = 8
+
     distributions: Annotated[
         bool,
         Field(

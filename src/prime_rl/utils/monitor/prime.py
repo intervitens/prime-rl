@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import os
+import random
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,6 +39,7 @@ _SAMPLE_SCHEMA = pa.schema(
         ("sample_id", pa.int64()),
         ("prompt", pa.string()),
         ("completion", pa.string()),
+        ("completion_text", pa.string()),
         ("trajectory", pa.string()),
         ("answer", pa.string()),
         ("task", pa.string()),
@@ -48,9 +50,51 @@ _SAMPLE_SCHEMA = pa.schema(
         ("timing", pa.string()),
         ("num_input_tokens", pa.int64()),
         ("num_output_tokens", pa.int64()),
+        ("num_turns", pa.int64()),
+        ("num_tool_calls", pa.int64()),
+        ("tools_used", pa.string()),
+        ("is_completed", pa.bool_()),
+        ("is_truncated", pa.bool_()),
+        ("error", pa.string()),
         ("created_at", pa.timestamp("us", tz="UTC")),
     ]
 )
+
+
+def _flatten_completion_text(completion: list | str | None) -> str:
+    """Extract plain text from JSON-encoded completion messages."""
+    if not completion:
+        return ""
+    if isinstance(completion, str):
+        return completion
+    parts = []
+    for msg in completion:
+        if isinstance(msg, dict):
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        parts.append(part.get("text", ""))
+        elif isinstance(msg, str):
+            parts.append(msg)
+    return "\n".join(parts)
+
+
+def _extract_tool_info(trajectory: list) -> tuple[int, list[str]]:
+    """Count tool calls and collect tool names from trajectory steps."""
+    tool_count = 0
+    tool_names: set[str] = set()
+    for ts in trajectory:
+        for msg in ts.get("completion", []):
+            if not isinstance(msg, dict):
+                continue
+            for tc in msg.get("tool_calls", []) or []:
+                if isinstance(tc, dict) and "name" in tc:
+                    tool_count += 1
+                    tool_names.add(tc["name"])
+    return tool_count, sorted(tool_names)
 
 
 class PrimeMonitor(Monitor):
@@ -143,14 +187,17 @@ class PrimeMonitor(Monitor):
             or not self.config.log_extras.samples
             or step % self.config.log_extras.interval != 0
         ):
-            # Do not log samples if not enabled or not log interval step
             return
 
         assert self.last_log_samples_step <= step, "Step must be greater than last logged step"
         assert step not in self._pending_sample_steps, f"Step {step} upload already in progress"
         assert self.logger is not None, "Logger is required for sample logging"
 
-        self.logger.info(f"Logging samples to Prime Intellect API at step {step}")
+        max_samples = self.config.log_extras.max_samples
+        if max_samples is not None and len(rollouts) > max_samples:
+            rollouts = random.sample(rollouts, max_samples)
+
+        self.logger.info(f"Logging {len(rollouts)} samples to Prime Intellect API at step {step}")
         start_time = time.perf_counter()
 
         parquet_bytes = self._rollouts_to_parquet_bytes(rollouts, step)
@@ -173,7 +220,7 @@ class PrimeMonitor(Monitor):
         now = datetime.now(timezone.utc)
         rows = []
 
-        for rollout in rollouts:
+        for idx, rollout in enumerate(rollouts):
             prompt = rollout.get("prompt")
             completion = rollout.get("completion")
             trajectory = rollout.get("trajectory") or []
@@ -193,15 +240,24 @@ class PrimeMonitor(Monitor):
                 for ts in trajectory
             ]
 
+            num_tool_calls, tool_names = _extract_tool_info(trajectory)
+            error_info = rollout.get("error")
+            error_str = ""
+            if isinstance(error_info, dict):
+                error_str = error_info.get("error", "")
+            elif isinstance(error_info, str):
+                error_str = error_info
+
             rows.append(
                 {
                     "run_id": self.run_id,
                     "step": step,
                     "tag": "",
-                    "problem_id": 0,
-                    "sample_id": 0,
+                    "problem_id": rollout.get("example_id", 0),
+                    "sample_id": idx,
                     "prompt": json.dumps(prompt),
                     "completion": json.dumps(completion),
+                    "completion_text": _flatten_completion_text(completion),
                     "trajectory": json.dumps(trajectory_data),
                     "answer": rollout.get("answer") or "",
                     "task": rollout.get("task") or "",
@@ -212,6 +268,12 @@ class PrimeMonitor(Monitor):
                     "timing": _json(rollout.get("timing")),
                     "num_input_tokens": 0,
                     "num_output_tokens": 0,
+                    "num_turns": len(trajectory),
+                    "num_tool_calls": num_tool_calls,
+                    "tools_used": json.dumps(tool_names) if tool_names else "",
+                    "is_completed": bool(rollout.get("is_completed", False)),
+                    "is_truncated": bool(rollout.get("is_truncated", False)),
+                    "error": error_str,
                     "created_at": now,
                 }
             )
