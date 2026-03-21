@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import multiprocessing as mp
 import random
 import time
@@ -10,7 +11,7 @@ from prime_rl.orchestrator.advantage import compute_advantages
 from prime_rl.orchestrator.eval_utils import compute_eval_ckpt_step, get_eval_sampling_args
 from prime_rl.orchestrator.event_loop_lag import EventLoopLagMonitor
 from prime_rl.orchestrator.patches import monkey_patch_chat_completion_logprobs, monkey_patch_oai_iterable_types
-from prime_rl.orchestrator.trajectories import build_vlm_image_cache, interleave_rollout
+from prime_rl.orchestrator.trajectories import build_vlm_image_cache, interleave_rollout, offload_images_to_disk
 from prime_rl.transport import TrainingBatch, TrainingSample, setup_training_batch_sender
 from prime_rl.utils.pathing import get_log_dir
 
@@ -47,6 +48,7 @@ from prime_rl.orchestrator.vf_utils import (
     intercept_vf_logging,
     setup_env_client,
     spawn_env_server,
+    task_uses_group_scoring,
     wait_for_env_servers,
 )
 from prime_rl.utils.client import (
@@ -169,6 +171,25 @@ async def orchestrate(config: OrchestratorConfig):
         env_names=train_env_names,
         map_kwargs=dict(writer_batch_size=1),  # set defensively to not error on map operations on large datasets
     )
+    verification_enabled = config.verification.enabled
+
+    train_env_deferred_group_scoring_tasks = (
+        {env_name for env_name in train_env_names if task_uses_group_scoring(train_env_group, env_name)}
+        if verification_enabled
+        else set()
+    )
+    for train_env_name, env_cfg in zip(train_env_names, config.env):
+        env_cfg.extra_env_kwargs["score_rollouts"] = (
+            verification_enabled and train_env_name not in train_env_deferred_group_scoring_tasks
+        )
+    if not verification_enabled:
+        logger.info("Verification disabled; all training envs will skip scoring.")
+    elif train_env_deferred_group_scoring_tasks:
+        deferred_tasks = ", ".join(sorted(train_env_deferred_group_scoring_tasks))
+        logger.info(
+            f"Deferred group scoring enabled for training tasks: {deferred_tasks}. "
+            "Rollouts run individually and are scored once each group completes."
+        )
 
     train_env_addresses = []
     env_processes: list[mp.Process] = []
@@ -185,6 +206,11 @@ async def orchestrate(config: OrchestratorConfig):
             )
             env_processes.append(process)
         else:
+            if env_name in train_env_deferred_group_scoring_tasks:
+                logger.warning(
+                    f"Training env {env_name} uses external server at {env.address}. "
+                    "Ensure that server was started with score_rollouts=False."
+                )
             address = env.address
         logger.info(f"Connecting train environment {env_name} to server at {address}")
         train_env_addresses.append(address)
@@ -274,7 +300,7 @@ async def orchestrate(config: OrchestratorConfig):
         strict_async_level=config.strict_async_level,
         tasks_per_minute=config.tasks_per_minute,
         lora_name=config.model.lora.name if config.model.lora else None,
-        output_dir=config.output_dir,
+        deferred_group_scoring_tasks=train_env_deferred_group_scoring_tasks,
         config=config,
     )
 
@@ -351,10 +377,6 @@ async def orchestrate(config: OrchestratorConfig):
     logger.info(f"Starting orchestrator loop (max_steps={max_steps or 'infinite'})")
     is_first_step = True
     await set_semaphore(config.max_concurrent or -1)
-
-    # Track consecutive empty batches for retry logic
-    empty_batch_retries = 0
-    max_empty_batch_retries = 5
 
     # Persistent ThreadPoolExecutor for parallel rollout processing
     rollout_executor = ThreadPoolExecutor(max_workers=64)
@@ -472,6 +494,15 @@ async def orchestrate(config: OrchestratorConfig):
         generate_completions_time = scheduler.last_batch_generation_time
         train_rollouts = train_task.result()
 
+        # VLM: offload base64 images to disk immediately to free memory
+        if is_vlm:
+            offload_start = time.perf_counter()
+            num_offloaded = offload_images_to_disk(train_rollouts, config.output_dir)
+            if num_offloaded:
+                logger.info(
+                    f"VLM offloaded {num_offloaded} unique images to disk in {time.perf_counter() - offload_start:.2f}s"
+                )
+
         # Apply rollout filters (zeros reward/mask for degenerate generations)
         filter_metrics = apply_filters(rollout_filters, train_rollouts)
 
@@ -495,7 +526,8 @@ async def orchestrate(config: OrchestratorConfig):
         if is_vlm:
             vlm_cache = build_vlm_image_cache(train_rollouts, processor)
             logger.info(
-                f"VLM timing: extract={vlm_cache.extract_time:.2f}s, preprocess={vlm_cache.preprocess_time:.2f}s"
+                f"VLM timing: extract={vlm_cache.extract_time:.2f}s, preprocess={vlm_cache.preprocess_time:.2f}s "
+                f"({vlm_cache.num_unique_images} unique images from {vlm_cache.num_unique_examples} examples)"
             )
         else:
             vlm_cache = None
@@ -564,25 +596,6 @@ async def orchestrate(config: OrchestratorConfig):
             step=progress.step,
         )
 
-        # Retry with exponential backoff if batch is empty (e.g., inference temporarily unavailable)
-        if len(training_batch.examples) == 0:
-            empty_batch_retries += 1
-            if empty_batch_retries >= max_empty_batch_retries:
-                raise RuntimeError(
-                    f"Step {progress.step} failed after {max_empty_batch_retries} consecutive empty batches"
-                )
-            backoff = min(30 * (2 ** (empty_batch_retries - 1)), 300)  # 30s, 60s, 120s, 240s, 300s cap
-            logger.warning(
-                f"Step {progress.step} produced 0 training samples "
-                f"(attempt {empty_batch_retries}/{max_empty_batch_retries}). Retrying in {backoff}s..."
-            )
-            # Cancel validation task to avoid accumulating background tasks
-            val_task.cancel()
-            await asyncio.sleep(backoff)
-            continue
-
-        # Reset retry counter on successful batch
-        empty_batch_retries = 0
         training_batch_sender.send(training_batch)
 
         # Await and process val results
@@ -770,6 +783,11 @@ async def orchestrate(config: OrchestratorConfig):
         # Increment step
         progress.step += 1
         is_first_step = False
+
+        # Free large per-step objects to prevent memory accumulation
+        del train_rollouts, train_examples, training_batch, vlm_cache
+        del results_df, metrics_df, val_results_df
+        gc.collect()
 
         event_loop_lag_monitor.reset()
 

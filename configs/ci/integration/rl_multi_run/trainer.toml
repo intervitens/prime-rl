@@ -6,7 +6,7 @@ dist_timeout_seconds = 120
 [model]
 name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
 seq_len = 65536
-fused_lm_head_chunk_size = 8192
+fused_lm_head_token_chunk_size = 8192
 
 [model.lora]
 rank = 8
