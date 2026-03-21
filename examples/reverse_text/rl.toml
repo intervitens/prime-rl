@@ -2,11 +2,19 @@ max_steps = 20
 seq_len = 2048
 
 [model]
-name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
+name = "./Qwen3-15B-A2B-Base"
 
-[wandb]
-project = "reverse-text"
-name = "reverse-text"
+#[weight_broadcast]
+#type = "nccl"
+
+
+[deployment]
+num_train_gpus = 2
+num_infer_gpus = 2
+
+#[wandb]
+#project = "reverse-text"
+#name = "reverse-text"
 
 [orchestrator]
 batch_size = 128
@@ -18,9 +26,39 @@ max_tokens = 128
 [[orchestrator.env]]
 id = "reverse-text"
 
+[orchestrator.model.lora]
+name = "r8-1e-4"
+
 [trainer.optim]
 lr = 3e-6
+
+[trainer.model]
+impl = "custom"
+#fsdp_cpu_offload = true
+#ep = 2
+
+
+[trainer.model.lora]
+rank = 1
+
+[trainer.ckpt.weights]
+save_adapter_separately = true
+
+[trainer.model.ac_offloading]
+max_inflight_activations = 5
+
+[trainer.model.ac]
+freq = 1
 
 [ckpt] # Checkpoint at the end of training
 
 [inference]
+enable_lora = true
+gpu_memory_utilization = 0.9
+
+[inference.parallel]
+tp = 2
+
+#[inference.model]
+#quantization = "fp8"
+

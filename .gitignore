@@ -3,6 +3,9 @@
 *.jsonl
 configs/endpoints.py
 
+Qwen*
+Trinity*
+
 # Artifacts
 **/slurm
 !src/prime_rl/slurm
